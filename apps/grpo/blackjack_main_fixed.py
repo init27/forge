@@ -29,6 +29,8 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 import torchstore as ts
+
+from envs.openspiel_env import OpenSpielAction, OpenSpielEnv
 from forge.actors._torchstore_utils import (
     get_dcp_whole_state_dict_key,
     get_param_prefix,
@@ -50,12 +52,11 @@ from monarch.actor import endpoint
 from omegaconf import DictConfig
 from vllm.transformers_utils.tokenizer import get_tokenizer
 
-from envs.openspiel_env import OpenSpielEnv, OpenSpielAction
-
 
 @dataclass
 class Episode:
     """Episode data for BlackJack game."""
+
     episode_id: str
     pad_id: int
     request_len: int
@@ -138,9 +139,32 @@ def simple_grpo_loss(
 
 @dataclass
 class BlackJackReward(ForgeActor):
+    # @endpoint
+    # async def evaluate_response(
+    #     self, prompt: str, response: str, game_reward: float
+    # ) -> float:
+    #     reward = float(game_reward)
+    #     record_metric("reward/evaluate_response/avg_reward", reward, Reduce.MEAN)
+    #     record_metric("reward/evaluate_response/sum_reward", reward, Reduce.SUM)
+    #     return reward
     @endpoint
-    async def evaluate_response(self, prompt: str, response: str, game_reward: float) -> float:
+    async def evaluate_response(
+        self, prompt: str, response: str, game_reward: float
+    ) -> float:
+        # Base reward from game outcome
         reward = float(game_reward)
+
+        # Bonus: Penalize invalid responses more
+        text_lower = response.lower().strip()
+        if "hit" not in text_lower and "stand" not in text_lower:
+            reward -= 0.1  # Small penalty for unclear responses
+
+        # Scale up wins to make them more valuable
+        if game_reward > 0:
+            reward = 2.0  # Make wins worth more
+        elif game_reward == 0:
+            reward = 0.5  # Pushes are better than losses
+
         record_metric("reward/evaluate_response/avg_reward", reward, Reduce.MEAN)
         record_metric("reward/evaluate_response/sum_reward", reward, Reduce.SUM)
         return reward
@@ -187,13 +211,16 @@ def format_prompt(step_num: int, action_history: list, tokenizer) -> str:
         {"role": "system", "content": system},
         {"role": "user", "content": state_desc},
     ]
-    return tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
+    return tokenizer.apply_chat_template(
+        chat, tokenize=False, add_generation_prompt=True
+    )
 
 
 @dataclass
 class BlackJackEnvActor(ForgeActor):
     """Simple actor that just manages OpenEnv connections."""
-    server_url: str = "http://localhost:8000"
+
+    server_url: str = "http://localhost:8004"
     model: str = "Qwen/Qwen3-1.7B"
 
     @endpoint
@@ -276,10 +303,16 @@ async def main(cfg: DictConfig):
         ref_model,
         reward_actor,
     ) = await asyncio.gather(
-        BlackJackEnvActor.options(**cfg.actors.blackjack_env).as_actor(**cfg.blackjack_env),
+        BlackJackEnvActor.options(**cfg.actors.blackjack_env).as_actor(
+            **cfg.blackjack_env
+        ),
         Policy.options(**cfg.services.policy).as_service(**cfg.policy),
-        RLTrainer.options(**cfg.actors.trainer).as_actor(**cfg.trainer, loss=simple_grpo_loss),
-        ReplayBuffer.options(**cfg.actors.replay_buffer).as_actor(**cfg.replay_buffer, collate=collate),
+        RLTrainer.options(**cfg.actors.trainer).as_actor(
+            **cfg.trainer, loss=simple_grpo_loss
+        ),
+        ReplayBuffer.options(**cfg.actors.replay_buffer).as_actor(
+            **cfg.replay_buffer, collate=collate
+        ),
         ComputeAdvantages.options(**cfg.actors.compute_advantages).as_actor(),
         ReferenceModel.options(**cfg.services.ref_model).as_service(**cfg.ref_model),
         BlackJackReward.options(**cfg.services.reward_actor).as_service(),
@@ -324,7 +357,9 @@ async def main(cfg: DictConfig):
 
                 game_log("")
                 game_log("=" * 80)
-                game_log(f"🎰 GAME {game_idx + 1}/{group_size} (Rollout #{rollout_count + 1}) - ID: {game_id}")
+                game_log(
+                    f"🎰 GAME {game_idx + 1}/{group_size} (Rollout #{rollout_count + 1}) - ID: {game_id}"
+                )
                 game_log("=" * 80)
 
                 try:
@@ -347,7 +382,9 @@ async def main(cfg: DictConfig):
                         game_log("-" * 40)
 
                         # Call policy HERE (not in actor) ✅
-                        responses: list[Completion] = await policy.generate.route(prompt)
+                        responses: list[Completion] = await policy.generate.route(
+                            prompt
+                        )
                         response = responses[0]
 
                         game_log(f"\n🤖 Model response: '{response.text}'")
@@ -357,16 +394,22 @@ async def main(cfg: DictConfig):
                         action_name = "HIT" if action_id == 0 else "STAND"
                         action_history.append((action_id, action_name))
 
-                        game_log(f"➡️  Parsed action: {action_name} (action_id={action_id})")
+                        game_log(
+                            f"➡️  Parsed action: {action_name} (action_id={action_id})"
+                        )
 
                         # Store step data WITHOUT reward yet
-                        game_steps.append({
-                            "step_num": step_num,
-                            "prompt": prompt,
-                            "response": response,
-                        })
+                        game_steps.append(
+                            {
+                                "step_num": step_num,
+                                "prompt": prompt,
+                                "response": response,
+                            }
+                        )
 
-                        result = env.step(OpenSpielAction(action_id=action_id, game_name="blackjack"))
+                        result = env.step(
+                            OpenSpielAction(action_id=action_id, game_name="blackjack")
+                        )
                         obs = result.observation
                         done = result.done
 
@@ -376,28 +419,48 @@ async def main(cfg: DictConfig):
                         step_num += 1
 
                     # ✅ Game finished - get final outcome
-                    final_game_reward = result.reward  # +1 (win), -1 (loss), or 0 (push)
+                    final_game_reward = (
+                        result.reward
+                    )  # +1 (win), -1 (loss), or 0 (push)
 
-                    outcome_emoji = "🏆" if final_game_reward > 0 else ("💀" if final_game_reward < 0 else "🤝")
-                    outcome_text = "WIN" if final_game_reward > 0 else ("LOSS" if final_game_reward < 0 else "PUSH")
+                    outcome_emoji = (
+                        "🏆"
+                        if final_game_reward > 0
+                        else ("💀" if final_game_reward < 0 else "🤝")
+                    )
+                    outcome_text = (
+                        "WIN"
+                        if final_game_reward > 0
+                        else ("LOSS" if final_game_reward < 0 else "PUSH")
+                    )
 
                     game_log("")
-                    game_log(f"{outcome_emoji} FINAL OUTCOME: {outcome_text} (reward={final_game_reward})")
+                    game_log(
+                        f"{outcome_emoji} FINAL OUTCOME: {outcome_text} (reward={final_game_reward})"
+                    )
                     game_log(f"📊 Game length: {len(game_steps)} steps")
-                    game_log(f"🎲 Action sequence: {' → '.join([name for _, name in action_history])}")
+                    game_log(
+                        f"🎲 Action sequence: {' → '.join([name for _, name in action_history])}"
+                    )
 
                     # ✅ Assign final reward to ALL steps in this game
                     for step_data in game_steps:
-                        all_step_results.append({
-                            "game_id": game_id,
-                            "final_reward": final_game_reward,  # Same reward for all steps
-                            **step_data,
-                        })
+                        all_step_results.append(
+                            {
+                                "game_id": game_id,
+                                "final_reward": final_game_reward,  # Same reward for all steps
+                                **step_data,
+                            }
+                        )
 
                     # Log game metrics
                     record_metric("blackjack/count_games_played", 1, Reduce.SUM)
-                    record_metric("blackjack/avg_game_length", len(game_steps), Reduce.MEAN)
-                    record_metric("blackjack/game_outcome", final_game_reward, Reduce.MEAN)
+                    record_metric(
+                        "blackjack/avg_game_length", len(game_steps), Reduce.MEAN
+                    )
+                    record_metric(
+                        "blackjack/game_outcome", final_game_reward, Reduce.MEAN
+                    )
 
                 finally:
                     env.close()
@@ -406,7 +469,10 @@ async def main(cfg: DictConfig):
 
             # Process episodes
             episodes = []
-            input_ids = torch.ones((len(all_step_results), max_req_tokens + max_res_tokens), dtype=torch.long)
+            input_ids = torch.ones(
+                (len(all_step_results), max_req_tokens + max_res_tokens),
+                dtype=torch.long,
+            )
 
             for i, step_result in enumerate(all_step_results):
                 episode = Episode(
@@ -427,12 +493,16 @@ async def main(cfg: DictConfig):
 
                 episodes.append(episode)
                 input_ids[i, :max_req_tokens] = episode.request_tensor
-                input_ids[i, max_req_tokens:] = episode.response_tensor  # Fixed: should be max_req_tokens not max_res_tokens
+                input_ids[i, max_req_tokens:] = (
+                    episode.response_tensor
+                )  # Fixed: should be max_req_tokens not max_res_tokens
 
             t.step("reward_evaluation")
 
             # Get reference logprobs
-            ref_logprobs = await ref_model.forward.route(input_ids, max_req_tokens, return_logprobs=True)
+            ref_logprobs = await ref_model.forward.route(
+                input_ids, max_req_tokens, return_logprobs=True
+            )
             t.step("reference_model")
 
             for i, episode in enumerate(episodes):
@@ -453,7 +523,9 @@ async def main(cfg: DictConfig):
             wins = sum(1 for e in episodes if e.reward > 0)
             losses = sum(1 for e in episodes if e.reward < 0)
             pushes = sum(1 for e in episodes if e.reward == 0)
-            avg_reward = sum(e.reward for e in episodes) / len(episodes) if episodes else 0
+            avg_reward = (
+                sum(e.reward for e in episodes) / len(episodes) if episodes else 0
+            )
 
             game_log("")
             game_log("=" * 80)
@@ -466,7 +538,9 @@ async def main(cfg: DictConfig):
             game_log("=" * 80)
             game_log("")
 
-            print(f"Rollout {rollout_count} complete - collected {len(episodes)} episodes (W/L/P: {wins}/{losses}/{pushes})")
+            print(
+                f"Rollout {rollout_count} complete - collected {len(episodes)} episodes (W/L/P: {wins}/{losses}/{pushes})"
+            )
 
     async def continuous_training():
         """Training loop."""
@@ -479,7 +553,9 @@ async def main(cfg: DictConfig):
                 t.start()
                 restart_tracer = False
 
-            batch = await replay_buffer.sample.call_one(curr_policy_version=training_step)
+            batch = await replay_buffer.sample.call_one(
+                curr_policy_version=training_step
+            )
             if batch is None:
                 await asyncio.sleep(0.1)
             else:
@@ -511,7 +587,9 @@ async def main(cfg: DictConfig):
     num_rollout_threads = cfg.get("rollout_threads", 1)
     print(f"Starting BlackJack GRPO with {num_rollout_threads} rollout threads")
 
-    rollout_tasks = [asyncio.create_task(continuous_rollouts()) for _ in range(num_rollout_threads)]
+    rollout_tasks = [
+        asyncio.create_task(continuous_rollouts()) for _ in range(num_rollout_threads)
+    ]
     training_task = asyncio.create_task(continuous_training())
 
     try:
@@ -523,7 +601,9 @@ async def main(cfg: DictConfig):
         shutdown_event.set()
 
         try:
-            await asyncio.wait_for(asyncio.gather(*rollout_tasks, return_exceptions=True), timeout=5)
+            await asyncio.wait_for(
+                asyncio.gather(*rollout_tasks, return_exceptions=True), timeout=5
+            )
         except asyncio.TimeoutError:
             for t in rollout_tasks:
                 t.cancel()
@@ -534,6 +614,7 @@ async def main(cfg: DictConfig):
 
 
 if __name__ == "__main__":
+
     @parse
     def _main(cfg):
         asyncio.run(main(cfg))
