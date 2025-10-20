@@ -32,7 +32,7 @@ metric_logging:
 
 # BlackJack environment configuration
 blackjack_env:
-  server_url: "http://localhost:8000"
+  server_url: "http://localhost:8004"
   model: ${model}
 
 # Policy configuration (generator)
